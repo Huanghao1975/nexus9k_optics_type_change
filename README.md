@@ -30,6 +30,11 @@ Show status table (concurrently queries SPROM for relevant ports):
 ```bash
 python type.py status
 ```
+Print single-interface output as JSON (optionally include details):
+```bash
+python type.py Ethernet1/1/1 json
+python type.py Ethernet1/1/1 json details
+```
 Notes:
 - The script must run on the switch; `from cli import cli` is used to call NX-OS CLI commands.
 - The `status` command collects SPROM data concurrently for parent/first-sub ports. Running many concurrent CLI calls may be unstable in some guest shells — reduce concurrency if needed.

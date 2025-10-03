@@ -36,6 +36,7 @@ def display_help():
     print("  <interface_name> : Required. The full name of the Ethernet interface (e.g., Ethernet1/57/1).")
     print("                     When using 'status' command, only 'Ethernet' interfaces are processed.")
     print("  [details]        : Optional. If provided, the script will also append the 'transceiver details' output for the interface.")
+    print("  json             : Optional. If provided, the script will print the interface information as JSON (can be combined with 'details').")
     print("  status           : If provided, the script will show 'show interface status' output with modified transceiver types for all 'Ethernet' ports,")
     print("                     ignoring 'xcvrAbsent' ports for SPROM queries. SPROM queries for parent ports (Ethernet1/X) or first sub-ports (Ethernet1/X/1) are done concurrently.")
     print("\nExamples:")
@@ -411,9 +412,10 @@ if __name__ == "__main__":
         DEBUG_MODE = True
         sys.argv.remove("-D")
 
-    # Define variables to store the interface name and details flag
+    # Define variables to store the interface name and flags
     interface_to_check = ""
     include_details_flag = False
+    output_json_flag = False
     is_status_command = False
 
     # Check for command-line arguments
@@ -428,20 +430,90 @@ if __name__ == "__main__":
             display_help()
     else: # Single interface mode
         interface_to_check = sys.argv[1]
-        if len(sys.argv) > 2:
-            if sys.argv[2].lower() == "details":
+        # Accept multiple optional arguments (order doesn't matter): 'details' and/or 'json'
+        for extra_arg in sys.argv[2:]:
+            if extra_arg.lower() == "details":
                 include_details_flag = True
-            else: # Unknown argument
-                print(f"Error: Unknown argument '{sys.argv[2]}'. Did you mean 'details'?")
+            elif extra_arg.lower() == "json":
+                output_json_flag = True
+            else:
+                print(f"Error: Unknown argument '{extra_arg}'. Did you mean 'details' or 'json'?")
                 display_help()
-        elif len(sys.argv) > 3: # Too many arguments for single interface
-            print("Error: Too many arguments for single interface lookup.")
-            display_help()
 
     if is_status_command:
         process_status_command()
     else:
-        # Call the function and print the result, passing the interface name and details flag
-        result = process_single_interface_sprom(interface_to_check, include_details_flag)
-        print("\n--- Collected and Modified Transceiver Information ---")
-        print(result)
+        # If JSON output was requested for a single interface, produce structured JSON
+        if output_json_flag:
+            # First, collect SPROM parsed data to determine the final/calculated type
+            data = _get_transceiver_data(interface_to_check)
+            if not data:
+                error_obj = {
+                    "interface": interface_to_check,
+                    "error": f"Could not retrieve SPROM data for {interface_to_check} or transceiver not present.",
+                    "type": "--"
+                }
+                print(json.dumps(error_obj, indent=2))
+            else:
+                # Determine the final calculated type (may be same as original)
+                _, final_calculated_type_value = _determine_modified_type_from_parsed_data(data)
+
+                # Build the base output: per request do NOT expose original_sprom_type, modified_type or sprom_raw
+                output_obj = {
+                    "interface": interface_to_check,
+                    # expose only a single 'type' field (the final calculated/modified type)
+                    "type": final_calculated_type_value,
+                    # keep some parsed meta if useful (optional)
+                    "host_lane_count": data.get("host_lane_count", ""),
+                    "media_lane_count": data.get("media_lane_count", ""),
+                    "connector_type": data.get("connector_type", ""),
+                    "part_number": data.get("part_number", "")
+                }
+
+                # If the user requested details, fetch the details output in JSON and
+                # return that JSON structure with only the internal 'type' field replaced
+                # by the calculated final type (preserving all other keys/structure).
+                if include_details_flag:
+                    details_json_command = f"show interface {interface_to_check} transceiver details | json"
+                    try:
+                        debug_print(f"Calling cli('{details_json_command}') at {time.time()}")
+                        start_time = time.time()
+                        details_output = cli(details_json_command)
+                        end_time = time.time()
+                        debug_print(f"cli('{details_json_command}') finished in {end_time - start_time:.4f} seconds.")
+
+                        # Parse details JSON and replace the nested type field in-place.
+                        try:
+                            parsed_details = json.loads(details_output)
+
+                            # Navigate to TABLE_interface -> ROW_interface. ROW_interface may be a dict or a list.
+                            tbl = parsed_details.get("TABLE_interface")
+                            if tbl is not None:
+                                row = tbl.get("ROW_interface")
+                                if isinstance(row, list):
+                                    # Replace type in each entry
+                                    for r in row:
+                                        if isinstance(r, dict) and "type" in r:
+                                            r["type"] = final_calculated_type_value
+                                elif isinstance(row, dict):
+                                    if "type" in row:
+                                        row["type"] = final_calculated_type_value
+
+                            # Print the details JSON exactly (with only the 'type' changed)
+                            print(json.dumps(parsed_details, indent=2))
+                        except json.JSONDecodeError:
+                            # If parsing fails, fall back to previous wrapper behavior but include details_raw
+                            output_obj["details_raw"] = details_output
+                            print(json.dumps(output_obj, indent=2))
+                    except Exception as details_e:
+                        # CLI error fetching details - return wrapper with details_error
+                        output_obj["details_error"] = str(details_e)
+                        print(json.dumps(output_obj, indent=2))
+                else:
+                    # No details requested: print the compact wrapper object
+                    print(json.dumps(output_obj, indent=2))
+        else:
+            # Call the function and print the result, passing the interface name and details flag
+            result = process_single_interface_sprom(interface_to_check, include_details_flag)
+            print("\n--- Collected and Modified Transceiver Information ---")
+            print(result)
