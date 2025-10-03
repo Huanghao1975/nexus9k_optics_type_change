@@ -2,6 +2,13 @@ import re
 import sys
 import time # Import the time module
 import json # Import the json module
+import shlex
+
+# Optional interactive completion
+try:
+    import readline
+except Exception:
+    readline = None
 from concurrent.futures import ThreadPoolExecutor, as_completed # For concurrent execution
 
 # Global debug mode flag
@@ -46,6 +53,60 @@ def display_help():
     print("  type-check -D status")
     print("\n--- End of Usage Information ---\n")
     sys.exit(0)
+
+
+def interactive_prompt():
+    """Simple interactive prompt with tab-completion for common arguments.
+
+    When the script is launched without arguments, this helper lets the user type
+    a single command line (like: "Ethernet1/1/1 details json") with TAB completion
+    for a small set of candidates, then the input is parsed and used as argv.
+    """
+    print("No arguments supplied — entering interactive mode. Press TAB to complete options.")
+
+    candidates = [
+        "status",
+        "details",
+        "json",
+        "-D",
+        # A few example interfaces — users can type their actual interfaces too
+        "Ethernet1/1/1",
+        "Ethernet1/1/2",
+        "Ethernet1/64/1",
+        "Ethernet1/57/1",
+    ]
+
+    def completer(text, state):
+        options = [c for c in candidates if c.startswith(text)]
+        if state < len(options):
+            return options[state]
+        return None
+
+    if readline:
+        try:
+            readline.set_completer(completer)
+            # Use the common readline binding for tab completion
+            readline.parse_and_bind('tab: complete')
+        except Exception:
+            pass
+
+    try:
+        line = input('Enter command (e.g. Ethernet1/1/1 details json): ').strip()
+    except EOFError:
+        print()
+        display_help()
+
+    if not line:
+        display_help()
+
+    # Split into argv style tokens safely
+    try:
+        tokens = shlex.split(line)
+    except Exception:
+        tokens = line.split()
+
+    # Rebuild sys.argv for downstream parsing
+    sys.argv = [sys.argv[0]] + tokens
 
 def _get_sprom_query_interface(interface_name):
     """
@@ -210,7 +271,8 @@ def process_single_interface_sprom(interface_name_var, include_details=False):
     # If include_details is True, fetch and append the 'details' output
     if include_details:
         details_command = f"show interface {interface_name_var} transceiver details | begin \"Lane Number:\""
-        print(f"\nExecuting additional command: {details_command}") # This print is always shown as it's a direct action
+        # Only show this informational message when debug mode is enabled
+        debug_print(f"\nExecuting additional command: {details_command}")
         try:
             debug_print(f"Calling cli('{details_command}') at {time.time()}")
             start_time = time.time()
@@ -220,13 +282,44 @@ def process_single_interface_sprom(interface_name_var, include_details=False):
 
             modified_output_lines.append("\n--- Transceiver Details (Lane Information) ---")
             modified_output_lines.append(details_output)
-            print("Additional 'details' output collected.") # This print is always shown as it's a direct action
+            # Only show this informational message when debug mode is enabled
+            debug_print("Additional 'details' output collected.")
         except Exception as details_e:
             print(f"ERROR: cli('{details_command}') failed: {details_e}", file=sys.stderr) # Added error logging
             modified_output_lines.append(f"\nError collecting transceiver details: {details_e}")
             print(f"Error collecting transceiver details: {details_e}")
 
-    return "\n".join(modified_output_lines)
+    # Some SPROM/details blocks are added as multi-line strings. Expand all chunks
+    # into individual lines, filter out vendor/identifier-sensitive fields the user
+    # asked not to see, then rejoin.
+    suppress_prefixes = [
+        "Identifier",
+        "Connector",
+        "Vendor Name",
+        "Vendor OUI",
+        "Vendor Part No",
+        "Vendor Revision",
+        "Vendor Serial No",
+        "Date Code",
+    ]
+
+    final_lines = []
+    for chunk in modified_output_lines:
+        for ln in str(chunk).splitlines():
+            # Skip blank lines that are purely whitespace? Keep them to preserve spacing.
+            # Trim left/right for prefix matching only.
+            stripped = ln.strip()
+            if not stripped:
+                final_lines.append(ln)
+                continue
+
+            # If the line starts with any suppressed prefix, omit it
+            if any(stripped.startswith(pref) for pref in suppress_prefixes):
+                continue
+
+            final_lines.append(ln)
+
+    return "\n".join(final_lines)
 
 def process_status_command():
     """
